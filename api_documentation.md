@@ -25,6 +25,20 @@ python deploy_api.py
 | 图像加水印 | /watermark | POST | 为图像添加文字水印，支持自定义样式 |
 | 设置图像KB大小 | /set_kb | POST | 调整图像文件大小，以KB为单位 |
 | 证件照裁切 | /idphoto_crop | POST | 对已有的透明证件照进行裁切，调整人像位置和大小 |
+| 图片鉴黄检测 | /nsfw_check | POST | 检测图片是否包含不适当内容 |
+| PDF转图片 | /pdf2img | POST | 将PDF文件逐页渲染为PNG图片返回 |
+
+## 通用安全头
+
+以下接口需要携带安全请求头，否则返回 401：
+
+| 请求头 | 必填 | 说明 |
+|-------|------|------|
+| X-App-Id | 是 | 应用ID |
+| X-Timestamp | 是 | 时间戳 |
+| X-Signature | 是 | 请求签名，基于解密后的参数计算 |
+
+`payload` 参数为 AES-ECB 加密后的 JSON 字符串（Base64编码），使用与 `API_SECRET_KEY` 约定的密钥加密。`payload` 为必填参数，缺失或解密失败会返回 400。
 
 ## 接口详情
 
@@ -240,6 +254,61 @@ python deploy_api.py
 | status | bool | 状态码，true表示成功 |
 | image_base64_standard | string | 标准证件照的base64编码（PNG格式，透明背景） |
 | image_base64_hd | string | 高清证件照的base64编码（PNG格式，透明背景），仅当hd为True时返回 |
+
+### 8. 图片鉴黄检测
+
+**路径**：`/nsfw_check`
+
+**方法**：`POST`
+
+**功能**：检测图片是否包含不适当内容（NSFW），建议在图片上传后、处理前调用
+
+**请求参数**：
+
+| 参数名 | 类型 | 必填 | 默认值 | 说明 |
+|-------|------|------|--------|------|
+| input_image | file | 二选一 | None | 传入的图像文件 |
+| payload | string | 二选一 | None | 加密参数，解密后包含 input_image_base64 字段（图像文件的base64编码） |
+
+注：`input_image_base64` 与 `input_image` 至少提供其一，否则返回 400。
+
+**响应参数**：
+
+| 参数名 | 类型 | 说明 |
+|-------|------|------|
+| status | bool | 状态码，true表示请求成功 |
+| is_safe | bool | 图片是否安全 |
+| score | float | NSFW综合得分（0-1，越高越不安全） |
+| details | list | 检测到的不安全内容详情 |
+| message | string | 检测结果描述 |
+
+检测过程异常时返回 `status: false`、`is_safe: false`、`score: 1.0`，并在 `message` 中携带错误信息。
+
+### 9. PDF转图片
+
+**路径**：`/pdf2img`
+
+**方法**：`POST`
+
+**功能**：将PDF文件逐页渲染为PNG图片并返回
+
+**请求参数**：
+
+| 参数名 | 类型 | 必填 | 默认值 | 说明 |
+|-------|------|------|--------|------|
+| file | file | 是 | None | 传入的PDF文件，大小不超过20MB |
+| payload | string | 是 | None | 加密参数，解密后可包含 dpi 字段 |
+| dpi（payload内） | int | 否 | 150 | 渲染分辨率，范围72-300，超出将被截断 |
+
+**响应参数**：
+
+| 参数名 | 类型 | 说明 |
+|-------|------|------|
+| status | bool | 状态码，true表示成功 |
+| page_count | int | PDF总页数 |
+| images | list | 每页图片的base64编码列表（PNG格式），最多返回30页 |
+
+注：PDF超过30页时仅渲染前30页，`page_count` 仍为总页数。
 
 ## 请求示例
 

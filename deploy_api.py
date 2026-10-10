@@ -22,11 +22,14 @@ from starlette.formparsers import MultiPartParser
 from fastapi import Header, HTTPException, Request
 from hivision.security import verify_signature, decrypt_data
 from hivision.nsfw_detector import get_nsfw_checker
+from hivision import wechat_sec
+from starlette.concurrency import run_in_threadpool
 import os
 
-# 安全配置
-APP_ID = "wx_123456789"
-API_SECRET_KEY = "1234567890abcdef1234567890abcdef"
+# 安全配置：优先读取环境变量，未配置时回落到兼容值（上架前必须改为环境变量）
+# ⚠️ 严禁在生产环境使用默认回退值
+APP_ID = os.getenv("WX_APP_ID") or "wx_123456789"
+API_SECRET_KEY = os.getenv("API_SECRET_KEY") or "1234567890abcdef1234567890abcdef"
 
 # 设置Starlette表单字段大小限制
 MultiPartParser.max_part_size = 10 * 1024 * 1024  # 10MB
@@ -604,6 +607,151 @@ async def pdf2img(
         "status": True,
         "page_count": page_count,
         "images": images,
+    }
+
+
+# 登录接口：code 换 openid
+@app.post("/login")
+async def login(
+    payload: str = Form(None),
+    x_app_id: str = Header(None, alias="X-App-Id"),
+    x_timestamp: str = Header(None, alias="X-Timestamp"),
+    x_signature: str = Header(None, alias="X-Signature"),
+):
+    """
+    静默登录：接收 wx.login 的 code，换取 openid。
+
+    前端仅需保存 openid 用于后续内容安全检测（msgSecCheck 2.0 必传 openid），
+    session_key 属于敏感凭据，不下发给客户端。
+    """
+    if not all([x_app_id, x_timestamp, x_signature]):
+        raise HTTPException(status_code=401, detail="Missing security headers")
+
+    if x_app_id != APP_ID:
+        raise HTTPException(status_code=401, detail="Invalid App ID")
+
+    try:
+        data = decrypt_data(payload, API_SECRET_KEY)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Decryption failed: {str(e)}")
+
+    if not verify_signature(data, x_app_id, x_timestamp, x_signature, API_SECRET_KEY):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    code = data.get("code")
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing code")
+
+    try:
+        session = await run_in_threadpool(wechat_sec.code2session, code)
+    except Exception as e:
+        return {"status": False, "message": f"登录失败: {str(e)}"}
+
+    # 注意：session_key 必须保留在服务端，此处只返回 openid
+    return {
+        "status": True,
+        "openid": session.get("openid"),
+        "unionid": session.get("unionid"),
+    }
+
+
+# 文本内容安全检测接口（转发微信 msgSecCheck 2.0）
+@app.post("/text_check")
+async def text_check(
+    payload: str = Form(None),
+    x_app_id: str = Header(None, alias="X-App-Id"),
+    x_timestamp: str = Header(None, alias="X-Timestamp"),
+    x_signature: str = Header(None, alias="X-Signature"),
+):
+    """
+    文本内容安全检测。
+
+    入参（加密 payload）：
+    - content: str  待检测文本（必填，≤2500 字）
+    - openid:  str  用户 openid（必填，需用户近两小时访问过小程序）
+    - scene:   int  场景 1 资料 / 2 评论 / 3 论坛 / 4 社交日志（默认 2）
+
+    返回：
+    - status:  bool  请求是否成功
+    - is_safe: bool  文本是否安全（suggest == 'pass'）
+    - suggest: str   pass / review / risky
+    - label:   int   命中标签（100 正常）
+    - detail:  list  详细检测结果
+    - message: str   结果描述
+    """
+    if not all([x_app_id, x_timestamp, x_signature]):
+        raise HTTPException(status_code=401, detail="Missing security headers")
+
+    if x_app_id != APP_ID:
+        raise HTTPException(status_code=401, detail="Invalid App ID")
+
+    try:
+        data = decrypt_data(payload, API_SECRET_KEY)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Decryption failed: {str(e)}")
+
+    if not verify_signature(data, x_app_id, x_timestamp, x_signature, API_SECRET_KEY):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    content = (data.get("content") or "").strip()
+    openid = data.get("openid")
+    scene = int(data.get("scene", 2))
+
+    # 空文本直接放行
+    if not content:
+        return {
+            "status": True,
+            "is_safe": True,
+            "suggest": "pass",
+            "label": 100,
+            "detail": [],
+            "message": "空文本",
+        }
+
+    if not openid:
+        return {"status": False, "is_safe": False, "message": "缺少 openid"}
+
+    # 微信侧上限 2500 字，超长截断（避免 47001）
+    if len(content) > 2500:
+        content = content[:2500]
+
+    if scene not in (1, 2, 3, 4):
+        scene = 2
+
+    try:
+        result = await run_in_threadpool(wechat_sec.msg_sec_check, content, openid, scene)
+    except Exception as e:
+        # 接口异常时保守处理：不放行（由前端提示重试）
+        return {"status": False, "is_safe": False, "message": f"检测失败: {str(e)}"}
+
+    errcode = result.get("errcode", 0)
+
+    if errcode == 0:
+        res = result.get("result") or {}
+        suggest = res.get("suggest", "pass")
+        return {
+            "status": True,
+            "is_safe": suggest == "pass",
+            "suggest": suggest,
+            "label": res.get("label", 100),
+            "detail": result.get("detail", []),
+            "message": "检测通过" if suggest == "pass" else "检测到违规内容",
+        }
+
+    # 61010: 用户未在近两小时访问过小程序；40003: 非法 openid
+    if errcode in (40003, 43104, 61010):
+        return {
+            "status": False,
+            "is_safe": False,
+            "errcode": errcode,
+            "message": f"用户身份校验失败({errcode})，请重新进入小程序后重试",
+        }
+
+    return {
+        "status": False,
+        "is_safe": False,
+        "errcode": errcode,
+        "message": f"微信接口返回错误: {result.get('errmsg', errcode)}",
     }
 
 

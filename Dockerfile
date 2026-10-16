@@ -1,5 +1,11 @@
 FROM python:3.10-slim
 
+RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i 's|deb.debian.org|mirrors.tencent.com|g; s|security.debian.org|mirrors.tencent.com|g' /etc/apt/sources.list.d/debian.sources; \
+    else \
+        sed -i 's|deb.debian.org|mirrors.tencent.com|g; s|security.debian.org|mirrors.tencent.com|g' /etc/apt/sources.list; \
+    fi \
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
@@ -11,7 +17,9 @@ WORKDIR /app
 
 COPY requirements.txt requirements-app.txt ./
 
-RUN pip install --no-cache-dir -r requirements.txt -r requirements-app.txt
+RUN pip install  \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    -r requirements.txt -r requirements-app.txt
 
 COPY . .
 

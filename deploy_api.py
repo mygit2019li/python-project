@@ -23,6 +23,7 @@ from fastapi import Header, HTTPException, Request
 from hivision.security import verify_signature, decrypt_data
 from hivision.nsfw_detector import get_nsfw_checker
 from hivision import wechat_sec
+from hivision.text_moderation import get_text_moderator
 from starlette.concurrency import run_in_threadpool
 import os
 
@@ -655,7 +656,7 @@ async def login(
     }
 
 
-# 文本内容安全检测接口（转发微信 msgSecCheck 2.0）
+# 文本内容安全检测接口（本地 DFA 开源方案，替代微信 msgSecCheck）
 @app.post("/text_check")
 async def text_check(
     payload: str = Form(None),
@@ -664,19 +665,19 @@ async def text_check(
     x_signature: str = Header(None, alias="X-Signature"),
 ):
     """
-    文本内容安全检测。
+    文本内容安全检测（本地敏感词 DFA 匹配）。
 
     入参（加密 payload）：
     - content: str  待检测文本（必填，≤2500 字）
-    - openid:  str  用户 openid（必填，需用户近两小时访问过小程序）
-    - scene:   int  场景 1 资料 / 2 评论 / 3 论坛 / 4 社交日志（默认 2）
+    - openid:  str  用户 openid（不再用于检测，仅保留字段兼容）
+    - scene:   int  场景（保留字段，本地检测暂不使用）
 
     返回：
     - status:  bool  请求是否成功
     - is_safe: bool  文本是否安全（suggest == 'pass'）
     - suggest: str   pass / review / risky
     - label:   int   命中标签（100 正常）
-    - detail:  list  详细检测结果
+    - detail:  list  命中详情 [{word, label, category, start, end}]
     - message: str   结果描述
     """
     if not all([x_app_id, x_timestamp, x_signature]):
@@ -694,8 +695,7 @@ async def text_check(
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     content = (data.get("content") or "").strip()
-    openid = data.get("openid")
-    scene = int(data.get("scene", 2))
+    openid = data.get("openid")   # 本地检测不再依赖 openid，仅保留字段兼容
 
     # 空文本直接放行
     if not content:
@@ -708,50 +708,35 @@ async def text_check(
             "message": "空文本",
         }
 
-    if not openid:
-        return {"status": False, "is_safe": False, "message": "缺少 openid"}
-
-    # 微信侧上限 2500 字，超长截断（避免 47001）
+    # 本地 DFA 检测上限 2500 字，超长截断
     if len(content) > 2500:
         content = content[:2500]
 
-    if scene not in (1, 2, 3, 4):
-        scene = 2
-
     try:
-        result = await run_in_threadpool(wechat_sec.msg_sec_check, content, openid, scene)
+        moderator = get_text_moderator()
+        result = await run_in_threadpool(moderator.moderate, content)
     except Exception as e:
-        # 接口异常时保守处理：不放行（由前端提示重试）
+        # 本地检测异常（如词库未加载）时保守处理：不放行
         return {"status": False, "is_safe": False, "message": f"检测失败: {str(e)}"}
 
-    errcode = result.get("errcode", 0)
-
-    if errcode == 0:
-        res = result.get("result") or {}
-        suggest = res.get("suggest", "pass")
+    suggest = result.get("suggest", "pass")
+    if suggest == "pass":
         return {
             "status": True,
-            "is_safe": suggest == "pass",
-            "suggest": suggest,
-            "label": res.get("label", 100),
-            "detail": result.get("detail", []),
-            "message": "检测通过" if suggest == "pass" else "检测到违规内容",
-        }
-
-    # 61010: 用户未在近两小时访问过小程序；40003: 非法 openid
-    if errcode in (40003, 43104, 61010):
-        return {
-            "status": False,
-            "is_safe": False,
-            "errcode": errcode,
-            "message": f"用户身份校验失败({errcode})，请重新进入小程序后重试",
+            "is_safe": True,
+            "suggest": "pass",
+            "label": 100,
+            "detail": [],
+            "message": "检测通过",
         }
 
     return {
-        "status": False,
+        "status": True,
         "is_safe": False,
-        "errcode": errcode,
-        "message": f"微信接口返回错误: {result.get('errmsg', errcode)}",
+        "suggest": suggest,
+        "label": result.get("label", 220),
+        "detail": result.get("detail", []),
+        "message": f"检测到敏感内容: {', '.join(result.get('hits', [])[:5])}",
     }
 
 

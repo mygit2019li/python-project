@@ -3,3 +3,4 @@ docs
 demo
 test
 *.onnx
+.DS_Store

@@ -15,6 +15,10 @@ RUN pip install --no-cache-dir -r requirements.txt -r requirements-app.txt
 
 COPY . .
 
+# 微信小程序凭证：用于 wx.login code2Session 换 openid 与 msgSecCheck 内容安全检测
+ENV WX_APPID=wx2839e4f9b66968f0
+ENV WX_SECRET=fed00aa9847998ea375c7a4019bc229d
+
 EXPOSE 8087
 
 CMD ["python3", "-u", "deploy_api.py"]
